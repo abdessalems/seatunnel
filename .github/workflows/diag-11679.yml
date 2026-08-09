@@ -1,0 +1,155 @@
+# Diagnostic harness for https://github.com/apache/seatunnel/issues/11679
+#
+# Reproduces the PaimonWithS3IT hang in CI and captures the one artifact the
+# issue thread is missing: a thread dump of the blocked seatunnel.sh client and
+# of the engine JVM, taken while the job is still stuck.
+#
+# This file lives only on a fork branch. It changes no engine, client or test
+# code, so it does not overlap with PR #11718, which bounds executeJob inside
+# PaimonWithS3IT itself.
+#
+# The hang is non-deterministic and only observed on the JDK 8 leg, so the
+# matrix runs several independent attempts in parallel.
+
+name: diag-11679 client hang thread dumps
+
+on:
+  workflow_dispatch:
+    inputs:
+      dump_after_minutes:
+        description: "Minutes to wait before the first thread dump"
+        required: true
+        default: "18"
+      job_timeout_minutes:
+        description: "Kill maven after this many minutes (exit 124 = hang reproduced)"
+        required: true
+        default: "50"
+
+permissions:
+  contents: read
+
+jobs:
+  reproduce:
+    name: "attempt ${{ matrix.attempt }} (jdk8)"
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      matrix:
+        attempt: [1, 2, 3, 4, 5, 6]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Free disk space
+        run: tools/github/free_disk_space.sh
+
+      - name: Start the thread-dump watchdog
+        env:
+          DUMP_AFTER: ${{ github.event.inputs.dump_after_minutes }}
+        run: |
+          mkdir -p /tmp/diag
+          cat > /tmp/watchdog.sh <<'WD'
+          #!/usr/bin/env bash
+          # Not set -e: a watchdog must never die on a failing probe.
+          DIAG=/tmp/diag
+          snap() {
+            local tag="$1" d="$DIAG/$tag"
+            mkdir -p "$d"
+            date -u +%FT%TZ > "$d/taken-at.txt"
+
+            # ---- runner side -------------------------------------------------
+            ps -ef > "$d/host-ps.txt" 2>&1
+            docker ps -a > "$d/docker-ps.txt" 2>&1
+            for pid in $(pgrep -f 'java' 2>/dev/null); do
+              jstack -l "$pid" > "$d/host-pid$pid.jstack" 2>&1 \
+                || kill -3 "$pid" 2>/dev/null
+            done
+
+            # ---- inside every running container ------------------------------
+            for c in $(docker ps -q 2>/dev/null); do
+              name=$(docker inspect --format '{{.Name}}' "$c" 2>/dev/null | tr -d '/')
+              [ -z "$name" ] && name="$c"
+              docker exec "$c" sh -c 'ps -ef' > "$d/ctr-$name-ps.txt" 2>&1
+              # java PIDs inside the container
+              for cp in $(docker exec "$c" sh -c "ps -eo pid,args | grep '[j]ava' | awk '{print \$1}'" 2>/dev/null); do
+                # jstack if the image has a JDK; otherwise SIGQUIT dumps to stdout
+                docker exec "$c" sh -c "jstack -l $cp" > "$d/ctr-$name-pid$cp.jstack" 2>/dev/null
+                if [ ! -s "$d/ctr-$name-pid$cp.jstack" ]; then
+                  rm -f "$d/ctr-$name-pid$cp.jstack"
+                  docker exec "$c" sh -c "kill -3 $cp" 2>/dev/null
+                  echo "SIGQUIT sent to pid $cp in $name; dump goes to that JVM's stdout" \
+                    >> "$d/sigquit-fallback.txt"
+                fi
+              done
+            done
+
+            # SIGQUIT output lands in the container log, so read logs afterwards
+            sleep 5
+            for c in $(docker ps -aq 2>/dev/null); do
+              name=$(docker inspect --format '{{.Name}}' "$c" 2>/dev/null | tr -d '/')
+              [ -z "$name" ] && name="$c"
+              docker logs "$c" > "$d/ctr-$name.log" 2>&1
+            done
+            echo "snapshot $tag done" >&2
+          }
+
+          sleep $((DUMP_AFTER * 60))
+          for i in 1 2 3 4 5 6; do
+            snap "t$(printf '%02d' $i)-$(date -u +%H%M%S)"
+            sleep 300
+          done
+          WD
+          chmod +x /tmp/watchdog.sh
+          nohup /tmp/watchdog.sh > /tmp/diag/watchdog.out 2>&1 &
+          echo "watchdog armed; first dump in ${DUMP_AFTER}m"
+
+      - name: Run PaimonWithS3IT
+        id: run
+        env:
+          MAVEN_OPTS: -Xmx4096m
+          JOB_TIMEOUT: ${{ github.event.inputs.job_timeout_minutes }}
+        run: |
+          set +e
+          timeout --signal=TERM --kill-after=60s "${JOB_TIMEOUT}m" \
+            ./mvnw -B -T 1 verify \
+              -DskipUT=true -DskipIT=false \
+              -Dit.test=PaimonWithS3IT \
+              -D"license.skipAddThirdParty"=true -D"skip.ui"=true \
+              --no-snapshot-updates -pl :connector-paimon-e2e -am -Pci \
+            2>&1 | tee /tmp/diag/maven.log
+          code=${PIPESTATUS[0]}
+          echo "maven exit code: $code" | tee /tmp/diag/maven-exit-code.txt
+          if [ "$code" = "124" ] || [ "$code" = "137" ]; then
+            echo "HANG REPRODUCED — maven was killed by timeout" | tee -a /tmp/diag/maven-exit-code.txt
+            echo "hang=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "hang=false" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
+      - name: Collect surefire and failsafe reports
+        if: always()
+        run: |
+          mkdir -p /tmp/diag/reports
+          find . -path '*/target/*-reports/*' -type f \
+            \( -name '*.txt' -o -name '*.xml' -o -name '*.dumpstream' \) \
+            -exec cp --parents {} /tmp/diag/reports/ \; 2>/dev/null || true
+          du -sh /tmp/diag || true
+          ls -R /tmp/diag | head -60
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-11679-attempt-${{ matrix.attempt }}-hang-${{ steps.run.outputs.hang }}
+          path: /tmp/diag
+          if-no-files-found: warn
+          retention-days: 14
