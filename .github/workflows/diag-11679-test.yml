@@ -32,7 +32,10 @@ jobs:
           mkdir -p /tmp/formatted
           cp seatunnel-engine/seatunnel-engine-server/src/test/java/org/apache/seatunnel/engine/server/TaskDeployStaleContextRaceTest.java \
              /tmp/formatted/ 2>/dev/null || true
-          git --no-pager diff --stat || true
+          cp seatunnel-engine/seatunnel-engine-server/src/main/java/org/apache/seatunnel/engine/server/TaskExecutionService.java \
+             /tmp/formatted/ 2>/dev/null || true
+          echo "--- files spotless reformatted (empty means already clean) ---"
+          git --no-pager diff --name-only || true
 
       - name: Upload the spotless-formatted test
         if: always()
