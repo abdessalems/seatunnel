@@ -118,10 +118,13 @@ jobs:
           JOB_TIMEOUT: ${{ github.event.inputs.job_timeout_minutes }}
         run: |
           set +e
+          # -DfailIfNoTests=false is required: with -am the reactor also builds the
+          # parent and dependency modules, and failsafe aborts the whole build on
+          # the first module that has no PaimonWithS3IT to run.
           timeout --signal=TERM --kill-after=60s "${JOB_TIMEOUT}m" \
             ./mvnw -B -T 1 verify \
               -DskipUT=true -DskipIT=false \
-              -Dit.test=PaimonWithS3IT \
+              -Dit.test=PaimonWithS3IT -DfailIfNoTests=false \
               -D"license.skipAddThirdParty"=true -D"skip.ui"=true \
               --no-snapshot-updates -pl :connector-paimon-e2e -am -Pci \
             2>&1 | tee /tmp/diag/maven.log
