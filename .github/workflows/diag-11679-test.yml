@@ -26,6 +26,22 @@ jobs:
       - name: Free disk space
         run: tools/github/free_disk_space.sh
 
+      - name: Apply spotless and export the formatted sources
+        run: |
+          ./mvnw -B spotless:apply -pl :seatunnel-engine-server --no-snapshot-updates || true
+          mkdir -p /tmp/formatted
+          cp seatunnel-engine/seatunnel-engine-server/src/test/java/org/apache/seatunnel/engine/server/TaskDeployStaleContextRaceTest.java \
+             /tmp/formatted/ 2>/dev/null || true
+          git --no-pager diff --stat || true
+
+      - name: Upload the spotless-formatted test
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: formatted-sources
+          path: /tmp/formatted
+          if-no-files-found: warn
+
       - name: Run TaskDeployStaleContextRaceTest
         run: |
           set +e
