@@ -1,0 +1,84 @@
+#
+# Licensed to the Apache Software Foundation (ASF) under one or more
+# contributor license agreements.  See the NOTICE file distributed with
+# this work for additional information regarding copyright ownership.
+# The ASF licenses this file to You under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with
+# the License.  You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+# Scratch-branch harness. Runs the whole TaskDeployStaleContextRaceTest class on
+# the JDK 8 leg so both methods report separately: the original deploy-returns
+# contract and the new task-group-future contract.
+
+name: verify-11679 regression test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          java-version: '8'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Free disk space
+        run: tools/github/free_disk_space.sh
+
+      - name: Confirm the compiler really targets Java 8
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME"
+          java -version 2>&1
+          ./mvnw -B -q help:evaluate -Dexpression=maven.compiler.target -DforceStdout \
+            -pl :seatunnel-engine-server 2>/dev/null | tail -1 | sed 's/^/maven.compiler.target=/'
+
+      - name: Run TaskDeployStaleContextRaceTest
+        run: |
+          set +e
+          ./mvnw -B -T 1 verify \
+            -DskipUT=false -DskipIT=true \
+            -Dtest=TaskDeployStaleContextRaceTest -DfailIfNoTests=false \
+            -D"license.skipAddThirdParty"=true -D"skip.ui"=true \
+            --no-snapshot-updates -pl :seatunnel-engine-server -am -Pci \
+            > /tmp/test.log 2>&1
+          echo "MAVEN_EXIT=$?"
+          echo "-------- per-method results --------"
+          grep -aE "Tests run|<<< (FAILURE|ERROR)|did not complete within|did not return within|BUILD (SUCCESS|FAILURE)" \
+            /tmp/test.log | tail -25
+        env:
+          MAVEN_OPTS: -Xmx4096m
+
+      - name: Upload surefire reports
+        if: always()
+        run: |
+          mkdir -p /tmp/out
+          cp /tmp/test.log /tmp/out/ 2>/dev/null || true
+          find . -path '*seatunnel-engine-server/target/surefire-reports/*' -type f \
+            -exec cp {} /tmp/out/ \; 2>/dev/null || true
+          ls /tmp/out | head
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: verify-output-${{ github.run_attempt }}
+          path: /tmp/out
+          if-no-files-found: warn
